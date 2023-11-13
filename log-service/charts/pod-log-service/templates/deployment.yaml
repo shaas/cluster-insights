@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-log-service
+  labels:
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-log-service
+  template:
+    metadata:
+      labels:
+        app: pod-log-service
+        chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    spec:
+      initContainers:
+      - name: wait-for-nats
+        image: bitnami/kubectl:1.25.11
+        command:
+        - /bin/sh
+        - -c
+        - >
+          while true; do
+            NOT_READY_PODS=$(kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=nats | grep -v 'box' | grep -v 'NAME' | grep -v '2/2')
+            if [ -z "$NOT_READY_PODS" ]; then
+              echo "NATS is ready. Terminating init container."
+              break
+            fi
+            echo "waiting for NATS pod to be ready."
+            echo $NOT_READY_PODS
+            sleep 10
+          done
+      containers:
+      - name: pod-log-service
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+      serviceAccountName: pod-log-service
