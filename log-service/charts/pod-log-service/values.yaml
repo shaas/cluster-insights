@@ -5,7 +5,7 @@
 image:
   prefix: pod-log-service
   repository: pod-log-service
-  tag: v0.8
+  tag: v0.13
   pullPolicy: IfNotPresent
 
 resources:

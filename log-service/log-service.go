@@ -12,26 +12,35 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
-func GetPodLogs(clientset *kubernetes.Clientset, wg *sync.WaitGroup, ctx context.Context, nc *nats.Conn, js jetstream.JetStream, namespace string, podName string, containerName string, follow bool) {
-	defer wg.Done()
+type PodLog struct {
+	ctx       context.Context
+	clientset *kubernetes.Clientset
+	nc        *nats.Conn
+	js        jetstream.JetStream
+	name      string
+	container string
+	namespace string
+}
 
+func GetPodLogs(logStruct PodLog) {
 	count := int64(100)
 	podLogOptions := v1.PodLogOptions{
 		Follow:    true,
 		TailLines: &count,
-		Container: containerName,
+		Container: logStruct.container,
 	}
 
-	podLogRequest := clientset.CoreV1().
-		Pods(namespace).
-		GetLogs(podName, &podLogOptions)
+	podLogRequest := logStruct.clientset.CoreV1().
+		Pods(logStruct.namespace).
+		GetLogs(logStruct.name, &podLogOptions)
 	stream, err := podLogRequest.Stream(context.TODO())
 	if err != nil {
-		log.Printf("%s:%s -> %s", namespace, podName, err)
+		log.Printf("%s:%s -> %s", logStruct.namespace, logStruct.name, err)
 		return
 	}
 	defer stream.Close()
@@ -49,21 +58,53 @@ func GetPodLogs(clientset *kubernetes.Clientset, wg *sync.WaitGroup, ctx context
 		}
 
 		if err != nil {
-			log.Printf("%s:%s -> %s", namespace, podName, err)
+			log.Printf("%s:%s -> %s", logStruct.namespace, logStruct.name, err)
 			return
 		}
 
 		message := string(buf[:numBytes])
 
-		if nc.Status() == nats.CONNECTED {
-			if _, err := js.Publish(ctx, "ls."+podName, []byte(message)); err != nil {
+		if logStruct.nc.Status() == nats.CONNECTED {
+			if _, err := logStruct.js.Publish(logStruct.ctx, "ls."+logStruct.name, []byte(message)); err != nil {
 				log.Fatalf("JetStream publish: %s\n", err)
 			}
 		}
 
 	}
+}
 
-	return
+func watchPods(ctx context.Context, clientset *kubernetes.Clientset, nc *nats.Conn, js jetstream.JetStream) {
+	var wg sync.WaitGroup
+	defer wg.Done()
+	timeOut := int64(60)
+	watcher, err := clientset.CoreV1().Pods("").Watch(context.Background(), metav1.ListOptions{TimeoutSeconds: &timeOut})
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// watch for new pods
+	for event := range watcher.ResultChan() {
+		item := event.Object.(*v1.Pod)
+
+		switch event.Type {
+		case watch.Added:
+			for _, container := range item.Spec.Containers {
+				logStruct := PodLog{
+					ctx:       ctx,
+					name:      item.Name,
+					container: container.Name,
+					clientset: clientset,
+					namespace: item.Namespace,
+					nc:        nc,
+					js:        js,
+				}
+				wg.Add(1)
+				go GetPodLogs(logStruct)
+			}
+		}
+	}
+	wg.Wait()
 }
 
 func main() {
@@ -71,6 +112,7 @@ func main() {
 	defer cancel()
 
 	var wg sync.WaitGroup
+	defer wg.Done()
 	ns := os.Getenv("POD_NAMESPACE")
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -93,7 +135,7 @@ func main() {
 
 	nc, err := nats.Connect(srv.Spec.ClusterIP + ":4222")
 	if err != nil {
-		log.Fatalf("NATS: %s : %s", &srv.Spec.ClusterIP, err)
+		log.Fatalf("NATS: %s : %s", srv.Spec.ClusterIP, err)
 	}
 
 	js, err := jetstream.New(nc)
@@ -109,17 +151,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("There are %d pods in the cluster\n", len(pods.Items))
-	for _, pod := range pods.Items {
-		for _, container := range pod.Spec.Containers {
-			wg.Add(1)
-			go GetPodLogs(clientset, &wg, ctx, nc, js, pod.Namespace, pod.Name, container.Name, false)
-		}
-	}
+	wg.Add(1)
+	go watchPods(ctx, clientset, nc, js)
 	wg.Wait()
 
 }
